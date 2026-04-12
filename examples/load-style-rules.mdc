@@ -1,0 +1,8 @@
+---
+description: Load persistent coding standards through MCP
+alwaysApply: true
+---
+
+# Load Persistent Standards
+
+Before making code changes, query the `persistent-code` MCP server for the relevant style pack and matching rules for the current file path.

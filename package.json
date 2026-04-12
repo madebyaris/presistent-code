@@ -1,0 +1,43 @@
+{
+  "name": "presistent-code",
+  "version": "0.1.0",
+  "description": "Local-first persistent code style packs for MCP-enabled IDEs and CLI workflows.",
+  "type": "module",
+  "bin": {
+    "persistent-code": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "cli": "tsx src/cli.ts",
+    "mcp": "tsx src/mcp.ts",
+    "test": "vitest run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/madebyaris/presistent-code.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/madebyaris/presistent-code/issues"
+  },
+  "homepage": "https://github.com/madebyaris/presistent-code#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.8.0",
+    "commander": "^14.0.3",
+    "minimatch": "^10.2.5",
+    "mysql2": "^3.22.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.4"
+  }
+}
