@@ -5,6 +5,7 @@ import { z } from "zod";
 import { LocalStore } from "./local-store.js";
 import { searchRemoteRules } from "./tidb.js";
 import { defaultStoreDir } from "./utils.js";
+import type { ExportedPack, Rule, RuleExplanation } from "./types.js";
 
 export async function runMcpServer(storePath = defaultStoreDir()): Promise<void> {
   const store = await LocalStore.open(storePath);
@@ -154,6 +155,184 @@ export async function runMcpServer(storePath = defaultStoreDir()): Promise<void>
           {
             type: "text",
             text: JSON.stringify(snapshot, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── P0: Preload rules for project ───────────────────────────────────────
+
+  server.registerTool(
+    "preload_rules_for_project",
+    {
+      title: "Preload Rules For Project",
+      description:
+        "Load all always-apply rules and provide instructions for targeted rule loading. Call this once at the start of a session to prime the context.",
+      inputSchema: {
+        projectPath: z.string().describe("Absolute path to the project root"),
+        pack: z.string().optional().describe("Optional pack id or slug to limit scope"),
+      },
+    },
+    async ({ projectPath, pack }) => {
+      const packs2 = pack ? [store.requirePack(pack)] : store.listPacks().map((p) => store.requirePack(p.id));
+      const alwaysApplyRules: { rule: Rule; packName: string }[] = [];
+      const packRuleCounts: { packName: string; ruleCount: number }[] = [];
+
+      for (const p of packs2) {
+        const rules = store.listRules(p.id);
+        packRuleCounts.push({ packName: p.name, ruleCount: rules.length });
+        for (const rule of rules) {
+          if (rule.alwaysApply) {
+            alwaysApplyRules.push({ rule, packName: p.name });
+          }
+        }
+      }
+
+      const body = [
+        `# Preloaded Rules for ${projectPath}`,
+        "",
+        "## Always-Apply Rules (active for all files)",
+        ...alwaysApplyRules.map(({ rule, packName }) =>
+          `### [${packName}] ${rule.title}\n\n${rule.bodyMarkdown}`),
+        "",
+        "## Targeted Rules",
+        "For each file you edit, call `get_rules_for_glob` with the file path to load file-specific rules.",
+        "",
+        `## Available Packs (${packs2.length})`,
+        ...packRuleCounts.map(({ packName, ruleCount }) => `- ${packName}: ${ruleCount} rule(s)`),
+      ].join("\n");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: body,
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── P3: Explain rules ───────────────────────────────────────────────────
+
+  server.registerTool(
+    "explain_rules_for_path",
+    {
+      title: "Explain Rules For Path",
+      description: "Return all rules that apply to a given file path, with human-readable explanations of WHY each rule applies.",
+      inputSchema: {
+        targetPath: z.string().describe("Path to explain rules for"),
+        pack: z.string().optional().describe("Optional pack id or slug to limit scope"),
+      },
+    },
+    async ({ targetPath, pack }): Promise<{ content: { type: "text"; text: string }[] }> => {
+      const explanation: RuleExplanation = store.explainRulesForPath(targetPath, pack);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(explanation, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── P1: Lint ────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "lint_rules",
+    {
+      title: "Lint Rules",
+      description: "Audit the rule store for issues: orphan rules, overlapping globs, contradictions, and unused packs.",
+      inputSchema: {
+        pack: z.string().optional().describe("Optional pack id or slug to limit lint scope"),
+      },
+    },
+    async ({ pack }) => {
+      const result = store.lint();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── P4: Rule activity ──────────────────────────────────────────────────
+
+  server.registerTool(
+    "get_rule_activity",
+    {
+      title: "Get Rule Activity",
+      description: "Return recent rule usage activity — how many times each rule has been matched.",
+      inputSchema: {
+        ruleId: z.string().optional().describe("Optional rule id to filter activity"),
+        limit: z.number().int().positive().max(200).optional().default(50).describe("Max entries to return"),
+        since: z.string().optional().describe("ISO date string — only return activity after this date"),
+      },
+    },
+    async ({ ruleId, limit, since }) => {
+      const activity = store.getRuleActivity(ruleId, { limit, since });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(activity, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── P5: Digest ────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "get_digest_report",
+    {
+      title: "Get Digest Report",
+      description: "Generate a health and activity report for the rule store — most/least used rules, stale rules, and a health score.",
+      inputSchema: {
+        codebasePath: z.string().optional().describe("Optional project path to cross-check glob coverage"),
+      },
+    },
+    async ({ codebasePath }) => {
+      const report = store.getDigestReport();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(report, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // ─── P2: Import diff ────────────────────────────────────────────────────
+
+  server.registerTool(
+    "diff_import",
+    {
+      title: "Diff Import",
+      description: "Preview what would change if you imported an exported pack JSON — without making any changes.",
+      inputSchema: {
+        packJson: z.string().describe("JSON string of an ExportedPack (same format as export_pack returns)"),
+        name: z.string().optional().describe("Override name for the imported pack"),
+      },
+    },
+    async ({ packJson, name }) => {
+      const snapshot = JSON.parse(packJson) as ExportedPack;
+      const diff = store.diffImport(snapshot);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(diff, null, 2),
           },
         ],
       };
