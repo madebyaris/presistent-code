@@ -108,3 +108,109 @@ export interface SyncOptions {
   remoteName?: string;
   pack?: string;
 }
+
+export interface RuleActivityEntry {
+  id: string;
+  ruleId: string;
+  matchedPath: string | null;
+  matchedBy: "alwaysApply" | "glob";
+  occurredAt: string;
+}
+
+export interface LintResult {
+  issues: LintIssue[];
+  summary: LintSummary;
+}
+
+export interface LintIssue {
+  type: "orphan_rule" | "overlapping_glob" | "contradiction" | "stale_rule" | "unused_pack";
+  severity: "error" | "warning" | "info";
+  ruleId?: string;
+  packId?: string;
+  message: string;
+  details?: string;
+}
+
+export interface LintSummary {
+  totalRules: number;
+  totalPacks: number;
+  orphanRules: number;
+  overlappingGlobPairs: number;
+  contradictions: number;
+  staleRules: number;
+  unusedPacks: number;
+}
+
+export interface ImportDiffPack {
+  name: string;
+  action: "create" | "skip" | "conflict";
+  localVersion?: StylePack;
+  remoteVersion?: StylePack;
+}
+
+export interface ImportDiff {
+  packs: ImportDiffPack[];
+  newRules: Rule[];
+  updatedRules: Array<{ local: Rule; remote: Rule }>;
+  unchangedRules: Rule[];
+  conflicts: ImportConflict[];
+  suggestions: ImportSuggestion[];
+}
+
+export interface ImportConflict {
+  localRule: Rule;
+  remoteRule: Rule;
+  field: string;
+  localValue: unknown;
+  remoteValue: unknown;
+}
+
+export interface ImportSuggestion {
+  type: "merge" | "replace" | "keep_local" | "keep_remote";
+  ruleId: string;
+  ruleTitle: string;
+  reason: string;
+}
+
+export interface RuleExplanation {
+  path: string;
+  pack: StylePackSummary;
+  matchedRules: ResolvedRuleExplanation[];
+  alwaysApplyRules: ResolvedRuleExplanation[];
+  totalMatched: number;
+}
+
+export interface ResolvedRuleExplanation extends ResolvedRule {
+  whyItApplies: string;
+  precedence: number;
+}
+
+export interface DigestReport {
+  generatedAt: string;
+  storeDir: string;
+  packCount: number;
+  ruleCount: number;
+  totalRuleMatches: number;
+  mostMatchedRules: RuleActivitySummary[];
+  leastMatchedRules: RuleActivitySummary[];
+  rulesWithNoMatches: string[];
+  recentlyActiveRules: RuleActivitySummary[];
+  staleRules: RuleActivitySummary[];
+  healthScore: number;
+}
+
+export interface RuleActivitySummary {
+  ruleId: string;
+  title: string;
+  packName: string;
+  matchCount: number;
+  lastMatchedAt: string | null;
+  lastMatchedPath: string | null;
+}
+
+export interface StoreStats {
+  packCount: number;
+  ruleCount: number;
+  totalMatches: number;
+  rulesWithNoMatches: number;
+}

@@ -6,13 +6,26 @@ import { writeFile } from "node:fs/promises";
 import type {
   CreatePackInput,
   CreateShareTokenInput,
+  DigestReport,
   ExportedPack,
+  ImportConflict,
+  ImportDiff,
+  ImportDiffPack,
+  ImportSuggestion,
+  LintIssue,
+  LintResult,
+  LintSummary,
   RemoteProfile,
   ResolvedRule,
+  ResolvedRuleExplanation,
   Rule,
+  RuleActivityEntry,
+  RuleActivitySummary,
+  RuleExplanation,
   SearchResult,
   ShareToken,
   StoreMetadata,
+  StoreStats,
   StylePack,
   StylePackSummary,
   SyncOptions,
@@ -311,11 +324,13 @@ export class LocalStore {
     for (const rule of rules) {
       if (rule.alwaysApply) {
         matches.push({ ...rule, matchedBy: "alwaysApply" });
+        this.recordRuleMatch(rule.id, targetPath, "alwaysApply");
         continue;
       }
 
       if (rule.globs.some((glob) => minimatch(targetPath, glob, { dot: true }))) {
         matches.push({ ...rule, matchedBy: "glob" });
+        this.recordRuleMatch(rule.id, targetPath, "glob");
       }
     }
 
@@ -671,6 +686,17 @@ export class LocalStore {
         max_uses integer,
         created_at text not null
       );
+
+      create table if not exists rule_activity (
+        id text primary key,
+        rule_id text not null references rules(id) on delete cascade,
+        matched_path text,
+        matched_by text not null,
+        occurred_at text not null
+      );
+
+      create index if not exists idx_rule_activity_rule_id on rule_activity(rule_id);
+      create index if not exists idx_rule_activity_occurred_at on rule_activity(occurred_at);
     `);
 
     try {
@@ -705,7 +731,7 @@ export class LocalStore {
     return next;
   }
 
-  private requirePack(identifier: string): StylePack {
+  requirePack(identifier: string): StylePack {
     const pack = this.getPack(identifier);
     if (!pack) {
       throw new Error(`Pack "${identifier}" not found.`);
@@ -753,5 +779,516 @@ export class LocalStore {
 
   private async saveMetadata(): Promise<void> {
     await writeJsonAtomic(this.metadataPath, this.#metadata);
+  }
+
+  // ─── Activity Tracking ──────────────────────────────────────────────────────
+
+  recordRuleMatch(ruleId: string, matchedPath: string | null, matchedBy: "alwaysApply" | "glob"): void {
+    const entry: RuleActivityEntry = {
+      id: makeId("ra"),
+      ruleId,
+      matchedPath,
+      matchedBy,
+      occurredAt: nowIso(),
+    };
+
+    this.#db
+      .prepare(
+        `insert into rule_activity (id, rule_id, matched_path, matched_by, occurred_at)
+         values (@id, @ruleId, @matchedPath, @matchedBy, @occurredAt)`,
+      )
+      .run(entry);
+  }
+
+  getRuleActivity(
+    ruleId?: string,
+    options: { limit?: number; since?: string } = {},
+  ): RuleActivityEntry[] {
+    const limit = options.limit ?? 100;
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (ruleId) {
+      conditions.push("rule_id = ?");
+      params.push(ruleId);
+    }
+    if (options.since) {
+      conditions.push("occurred_at >= ?");
+      params.push(options.since);
+    }
+
+    const where = conditions.length > 0 ? `where ${conditions.join(" and ")}` : "";
+    const rows = this.#db
+      .prepare(
+        `select * from rule_activity ${where}
+         order by occurred_at desc
+         limit ?`,
+      )
+      .all(...params, limit) as Array<{
+      id: string;
+      rule_id: string;
+      matched_path: string | null;
+      matched_by: string;
+      occurred_at: string;
+    }>;
+
+    return rows.map(
+      (row): RuleActivityEntry => ({
+        id: row.id,
+        ruleId: row.rule_id,
+        matchedPath: row.matched_path,
+        matchedBy: row.matched_by as "alwaysApply" | "glob",
+        occurredAt: row.occurred_at,
+      }),
+    );
+  }
+
+  getStats(): StoreStats {
+    const packs = this.listPacks();
+    const packCount = packs.length;
+    const ruleCount = this.#db.prepare("select count(*) as cnt from rules").get() as { cnt: number };
+
+    const totalMatches = this.#db
+      .prepare("select count(*) as cnt from rule_activity")
+      .get() as { cnt: number };
+
+    const rulesWithNoMatches = this.#db
+      .prepare(
+        `select count(*) as cnt from rules r
+         left join rule_activity a on a.rule_id = r.id
+         where a.id is null`,
+      )
+      .get() as { cnt: number };
+
+    return {
+      packCount,
+      ruleCount: Number(ruleCount.cnt),
+      totalMatches: Number(totalMatches.cnt),
+      rulesWithNoMatches: Number(rulesWithNoMatches.cnt),
+    };
+  }
+
+  // ─── Rule Explanation ────────────────────────────────────────────────────────
+
+  explainRulesForPath(targetPath: string, packIdentifier?: string): RuleExplanation {
+    const packs = packIdentifier
+      ? [this.requirePack(packIdentifier)]
+      : this.listPacks().map((p) => this.requirePack(p.id));
+
+    const packSummaries = Object.fromEntries(packs.map((p) => [p.id, p]));
+
+    const matchedRules: ResolvedRule[] = [];
+    const alwaysApplyRules: ResolvedRule[] = [];
+
+    for (const pack of packs) {
+      const rules = this.listRules(pack.id);
+      for (const rule of rules) {
+        if (rule.alwaysApply) {
+          alwaysApplyRules.push({ ...rule, matchedBy: "alwaysApply", packId: pack.id });
+        } else if (rule.globs.some((glob) => minimatch(targetPath, glob, { dot: true }))) {
+          matchedRules.push({ ...rule, matchedBy: "glob", packId: pack.id });
+        }
+      }
+    }
+
+    const resolvedMatched = matchedRules
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.title.localeCompare(b.title))
+      .map((rule, idx) => this.#explainResolvedRule(rule, targetPath, idx + 1));
+
+    const resolvedAlways = alwaysApplyRules
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.title.localeCompare(b.title))
+      .map((rule, idx) => this.#explainResolvedRule(rule, targetPath, resolvedMatched.length + idx + 1));
+
+    return {
+      path: targetPath,
+      pack: { ...Object.values(packSummaries)[0]!, ruleCount: packs.length },
+      matchedRules: resolvedMatched,
+      alwaysApplyRules: resolvedAlways,
+      totalMatched: resolvedMatched.length + resolvedAlways.length,
+    };
+  }
+
+  #explainResolvedRule(rule: ResolvedRule, targetPath: string, precedence: number): ResolvedRuleExplanation {
+    let whyItApplies: string;
+    if (rule.matchedBy === "alwaysApply") {
+      whyItApplies = "This rule has 'alwaysApply: true' — it applies to every file, regardless of path.";
+    } else {
+      const matchedGlobs = rule.globs.filter((glob) => minimatch(targetPath, glob, { dot: true }));
+      whyItApplies = `The path "${targetPath}" matches the glob pattern(s): ${matchedGlobs.join(", ")}.`;
+    }
+
+    return { ...rule, whyItApplies, precedence };
+  }
+
+  // ─── Lint ──────────────────────────────────────────────────────────────────
+
+  lint(codebasePaths?: string[]): LintResult {
+    const issues: LintIssue[] = [];
+    const packs = this.listPacks();
+    const allRules = packs.flatMap((p) => this.listRules(p.id));
+
+    const totalPacks = packs.length;
+    const totalRules = allRules.length;
+
+    // Orphan rules: rules whose pack has been deleted (already cascade, but check anyway)
+    // Stale rules: never matched
+    const rulesWithActivity = new Set(
+      this.#db
+        .prepare("select distinct rule_id from rule_activity")
+        .all()
+        .map((row: unknown) => (row as { rule_id: string }).rule_id),
+    );
+
+    for (const rule of allRules) {
+      if (!rulesWithActivity.has(rule.id)) {
+        issues.push({
+          type: "orphan_rule",
+          severity: "info",
+          ruleId: rule.id,
+          packId: rule.packId,
+          message: `Rule "${rule.title}" has never been matched.`,
+          details: `Consider removing it if it is no longer relevant, or use it in a project to confirm it works.`,
+        });
+      }
+    }
+
+    // Overlapping globs within the same pack
+    const rulesByPack = new Map<string, Rule[]>();
+    for (const rule of allRules) {
+      if (!rulesByPack.has(rule.packId)) {
+        rulesByPack.set(rule.packId, []);
+      }
+      rulesByPack.get(rule.packId)!.push(rule);
+    }
+
+    let overlappingGlobPairs = 0;
+    for (const [packId, rules] of rulesByPack) {
+      const nonAlwaysRules = rules.filter((r) => !r.alwaysApply);
+      for (let i = 0; i < nonAlwaysRules.length; i++) {
+        for (let j = i + 1; j < nonAlwaysRules.length; j++) {
+          const a = nonAlwaysRules[i]!;
+          const b = nonAlwaysRules[j]!;
+          const overlap = this.#globsOverlap(a.globs, b.globs);
+          if (overlap) {
+            overlappingGlobPairs++;
+            issues.push({
+              type: "overlapping_glob",
+              severity: "warning",
+              ruleId: a.id,
+              packId,
+              message: `Rules "${a.title}" and "${b.title}" have overlapping globs.`,
+              details: `Both rules could fire for the same files. Consider merging or adjusting their globs.\n  "${a.title}": ${a.globs.join(", ")}\n  "${b.title}": ${b.globs.join(", ")}`,
+            });
+          }
+        }
+      }
+    }
+
+    // Contradictions: same glob, different body
+    for (const [packId, rules] of rulesByPack) {
+      const nonAlwaysRules = rules.filter((r) => !r.alwaysApply);
+      for (let i = 0; i < nonAlwaysRules.length; i++) {
+        for (let j = i + 1; j < nonAlwaysRules.length; j++) {
+          const a = nonAlwaysRules[i]!;
+          const b = nonAlwaysRules[j]!;
+          if (this.#globsOverlap(a.globs, b.globs) && a.bodyMarkdown !== b.bodyMarkdown) {
+            issues.push({
+              type: "contradiction",
+              severity: "error",
+              ruleId: a.id,
+              packId,
+              message: `Rules "${a.title}" and "${b.title}" apply to overlapping files but have different guidance.`,
+              details: `These rules both match the same files but say different things. Resolve the contradiction by merging or clarifying their scopes.\n  "${a.title}": ${a.bodyMarkdown.slice(0, 80)}...\n  "${b.title}": ${b.bodyMarkdown.slice(0, 80)}...`,
+            });
+          }
+        }
+      }
+    }
+
+    // Unused packs: packs with zero rules
+    const unusedPacks = packs.filter((p) => p.ruleCount === 0);
+    for (const pack of unusedPacks) {
+      issues.push({
+        type: "unused_pack",
+        severity: "info",
+        packId: pack.id,
+        message: `Pack "${pack.name}" has no rules.`,
+        details: "Consider adding rules or removing this empty pack.",
+      });
+    }
+
+    // Cross-check against real codebase paths if provided
+    if (codebasePaths && codebasePaths.length > 0) {
+      for (const rule of allRules) {
+        if (rule.alwaysApply) continue;
+        const matchesAny = rule.globs.some((glob) =>
+          codebasePaths.some((p) => minimatch(p, glob, { dot: true })),
+        );
+        if (!matchesAny) {
+          issues.push({
+            type: "orphan_rule",
+            severity: "warning",
+            ruleId: rule.id,
+            packId: rule.packId,
+            message: `Rule "${rule.title}" has globs that match no files in the provided codebase paths.`,
+            details: `Globs: ${rule.globs.join(", ")}\nCodebase paths checked: ${codebasePaths.length} files/dirs.`,
+          });
+        }
+      }
+    }
+
+    const summary: LintSummary = {
+      totalRules,
+      totalPacks,
+      orphanRules: issues.filter((i) => i.type === "orphan_rule").length,
+      overlappingGlobPairs,
+      contradictions: issues.filter((i) => i.type === "contradiction").length,
+      staleRules: issues.filter((i) => i.type === "stale_rule").length,
+      unusedPacks: unusedPacks.length,
+    };
+
+    return { issues, summary };
+  }
+
+  #globsOverlap(a: string[], b: string[]): boolean {
+    if (a.length === 0 || b.length === 0) return false;
+    // Check if any file matching A could match B (conservative check)
+    // For simplicity: check if any glob pattern string is shared
+    const intersection = a.filter((ga) => b.some((gb) => ga === gb));
+    if (intersection.length > 0) return true;
+    // Heuristic: check prefix overlap (e.g. src/**/*.ts vs src/components/*.ts)
+    return a.some((ga) => b.some((gb) => ga.startsWith(gb.slice(0, ga.indexOf("*"))) || gb.startsWith(ga.slice(0, gb.indexOf("*")))));
+  }
+
+  // ─── Import Diff ───────────────────────────────────────────────────────────
+
+  diffImport(snapshot: ExportedPack): ImportDiff {
+    const conflicts: ImportConflict[] = [];
+    const suggestions: ImportSuggestion[] = [];
+    const newRules: Rule[] = [];
+    const updatedRules: Array<{ local: Rule; remote: Rule }> = [];
+    const unchangedRules: Rule[] = [];
+
+    const localPack = this.getPack(snapshot.pack.slug);
+
+    if (!localPack) {
+      const packAction: ImportDiffPack = {
+        name: snapshot.pack.name,
+        action: "create",
+        remoteVersion: snapshot.pack,
+      };
+
+      for (const rule of snapshot.rules) {
+        newRules.push(rule);
+        suggestions.push({
+          type: "replace",
+          ruleId: rule.id,
+          ruleTitle: rule.title,
+          reason: `New rule from imported pack "${snapshot.pack.name}".`,
+        });
+      }
+
+      return { packs: [packAction], newRules, updatedRules, unchangedRules, conflicts, suggestions };
+    }
+
+    const packAction: ImportDiffPack = {
+      name: snapshot.pack.name,
+      action: localPack ? "skip" : "create",
+      localVersion: localPack ?? undefined,
+      remoteVersion: snapshot.pack,
+    };
+
+    const localRules = new Map(this.listRules(localPack.id).map((r) => [r.title, r]));
+
+    for (const remoteRule of snapshot.rules) {
+      const localRule = localRules.get(remoteRule.title);
+      if (!localRule) {
+        newRules.push(remoteRule);
+        suggestions.push({
+          type: "replace",
+          ruleId: remoteRule.id,
+          ruleTitle: remoteRule.title,
+          reason: `New rule from imported pack.`,
+        });
+      } else if (localRule.bodyMarkdown !== remoteRule.bodyMarkdown || JSON.stringify(localRule.globs) !== JSON.stringify(remoteRule.globs)) {
+        updatedRules.push({ local: localRule, remote: remoteRule });
+
+        const hasConflict =
+          localRule.bodyMarkdown !== remoteRule.bodyMarkdown &&
+          localRule.globs.some((g) => remoteRule.globs.includes(g));
+
+        if (hasConflict) {
+          conflicts.push({
+            localRule,
+            remoteRule,
+            field: "bodyMarkdown",
+            localValue: localRule.bodyMarkdown,
+            remoteValue: remoteRule.bodyMarkdown,
+          });
+          suggestions.push({
+            type: "merge",
+            ruleId: localRule.id,
+            ruleTitle: localRule.title,
+            reason: `Conflict detected: local and remote versions differ on "${remoteRule.title}". Review and decide which to keep.`,
+          });
+        } else {
+          suggestions.push({
+            type: "replace",
+            ruleId: localRule.id,
+            ruleTitle: localRule.title,
+            reason: `Remote version of "${remoteRule.title}" has updates.`,
+          });
+        }
+      } else {
+        unchangedRules.push(remoteRule);
+      }
+    }
+
+    return {
+      packs: [packAction],
+      newRules,
+      updatedRules,
+      unchangedRules,
+      conflicts,
+      suggestions,
+    };
+  }
+
+  // ─── Digest Report ────────────────────────────────────────────────────────
+
+  getDigestReport(codebasePaths?: string[]): DigestReport {
+    const stats = this.getStats();
+    const packs = this.listPacks();
+    const allRules = this.listRulesAcrossPacks();
+    const now = nowIso();
+
+    // Get match counts per rule
+    const matchCounts = new Map<string, number>();
+    const lastMatch = new Map<string, { at: string; path: string | null }>();
+
+    const activityRows = this.#db
+      .prepare(
+        `select rule_id, count(*) as cnt, max(occurred_at) as last_at, max(matched_path) as last_path
+         from rule_activity
+         group by rule_id`,
+      )
+      .all() as Array<{ rule_id: string; cnt: number; last_at: string; last_path: string | null }>;
+
+    for (const row of activityRows) {
+      matchCounts.set(row.rule_id, Number(row.cnt));
+      lastMatch.set(row.rule_id, { at: row.last_at, path: row.last_path });
+    }
+
+    const packNames = new Map(packs.map((p) => [p.id, p.name]));
+    const ruleSummaries: RuleActivitySummary[] = allRules.map((rule) => ({
+      ruleId: rule.id,
+      title: rule.title,
+      packName: packNames.get(rule.packId) ?? "unknown",
+      matchCount: matchCounts.get(rule.id) ?? 0,
+      lastMatchedAt: lastMatch.get(rule.id)?.at ?? null,
+      lastMatchedPath: lastMatch.get(rule.id)?.path ?? null,
+    }));
+
+    const sortedByMatches = [...ruleSummaries].sort((a, b) => b.matchCount - a.matchCount);
+    const withMatches = sortedByMatches.filter((r) => r.matchCount > 0);
+    const noMatches = sortedByMatches.filter((r) => r.matchCount === 0);
+
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const recentlyActive = ruleSummaries
+      .filter((r) => r.lastMatchedAt && r.lastMatchedAt >= thirtyDaysAgo)
+      .sort((a, b) => b.lastMatchedAt!.localeCompare(a.lastMatchedAt!));
+
+    const stale = ruleSummaries.filter((r) => r.matchCount === 0).slice(0, 10);
+
+    // Run lint to get fresh issues for health score
+    const { issues } = this.lint(codebasePaths);
+    const healthScore = this.#calculateHealthScore(stats, issues, sortedByMatches.length);
+
+    return {
+      generatedAt: now,
+      storeDir: this.storeDir,
+      packCount: stats.packCount,
+      ruleCount: stats.ruleCount,
+      totalRuleMatches: stats.totalMatches,
+      mostMatchedRules: sortedByMatches.slice(0, 5),
+      leastMatchedRules: withMatches.slice(-5).reverse(),
+      rulesWithNoMatches: noMatches.map((r) => r.title),
+      recentlyActiveRules: recentlyActive.slice(0, 5),
+      staleRules: stale,
+      healthScore,
+    };
+  }
+
+  #calculateHealthScore(stats: StoreStats, issues: LintIssue[], activeRuleCount: number): number {
+    let score = 100;
+    score -= Math.min(stats.rulesWithNoMatches * 2, 30);
+    score -= issues.filter((i) => i.type === "contradiction").length * 10;
+    score -= issues.filter((i) => i.type === "overlapping_glob").length * 3;
+    score -= issues.filter((i) => i.type === "unused_pack").length * 5;
+    return Math.max(0, Math.min(100, score));
+  }
+
+  // ─── P6: Store CLAUDE.md ────────────────────────────────────────────────
+
+  async generateStoreClaudeMd(outPath?: string): Promise<string> {
+    const packs = this.listPacks();
+    const filePath = outPath ?? path.join(this.storeDir, "CLAUDE.md");
+
+    const packBlocks = packs
+      .map((p) => {
+        const rules = this.listRules(p.id);
+        const ruleLines = rules
+          .map(
+            (r) =>
+              `- **${r.title}**${r.alwaysApply ? " _(alwaysApply)_" : ""} — \`${r.globs.join(", ") || "(no globs)"}` +
+              `\n  ${r.bodyMarkdown.slice(0, 120)}${r.bodyMarkdown.length > 120 ? "..." : ""}`,
+          )
+          .join("\n");
+        return `### ${p.name} (\`${p.slug}\`)\n\n${ruleLines || "_no rules yet_"}`;
+      })
+      .join("\n\n");
+
+    const content = `# Persistent Code Store — ${this.storeDir}
+
+This directory is managed by [Persistent Code](https://github.com/madebyaris/presistent-code).
+Do not edit the database files directly. Use the CLI or MCP tools to modify rules and packs.
+
+## Style Packs
+
+${packs.length > 0 ? packBlocks : "_No packs created yet. Run \`persistent-code pack create\` to get started._"}
+
+## MCP Tools
+
+This store is exposed via MCP. Available tools:
+
+| Tool | Description |
+|------|-------------|
+| \`list_style_packs\` | List all packs with rule counts |
+| \`get_rules_for_glob\` | Get rules matching a file path |
+| \`search_rules\` | Full-text search across rules |
+| \`upsert_rule\` | Create or update a rule |
+| \`export_pack\` | Export a pack as JSON |
+| \`explain_rules_for_path\` | Explain why rules apply to a file |
+| \`lint_rules\` | Audit the store for issues |
+| \`get_rule_activity\` | View rule usage history |
+| \`get_digest_report\` | Health and activity digest |
+
+## Schema
+
+- **packs**: named collections of rules (e.g. "Team Defaults", "Frontend Guide")
+- **rules**: individual coding standards with glob patterns and alwaysApply flag
+- **rule_activity**: tracks which rules have fired (for health scoring)
+- **share_tokens**: for sharing packs via tokens
+
+## Conventions for Writing Rules
+
+1. **Title**: Be specific. "TypeScript: prefer explicit return types" not "TS imports"
+2. **Globs**: Use relative paths from project root, e.g. \`src/**/*.ts\`, not \`./src\`
+3. **Body**: Start with the rule itself (e.g. "Do X"), then explain WHY in a second paragraph
+4. **alwaysApply**: Only use for truly universal rules (e.g. "never use \`any\`")
+5. **Sort order**: Lower numbers = higher priority. 1-10 for critical rules, 100+ for niche ones
+`;
+    await writeFile(filePath, content, "utf8");
+    return filePath;
   }
 }
