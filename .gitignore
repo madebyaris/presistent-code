@@ -2,6 +2,7 @@ node_modules
 dist
 coverage
 tmp
+memory-persistence-test/
 
 .DS_Store
 *.log
